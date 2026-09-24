@@ -2,6 +2,15 @@
 
 A responsive blog application with a vanilla HTML/CSS frontend and a Node.js/Express REST API.
 
+## Student QR Generator
+
+The Student ID QR application is available here:
+
+- [Open Student QR Generator](student-qr.html)
+- [View Student QR Generator source](student-qr.html)
+
+It includes student registration, QR-code generation, WhatsApp sharing, QR verification, clipboard copying, and Google Sheets submission.
+
 ## Run locally
 
 1. Install Node.js 18 or newer.
