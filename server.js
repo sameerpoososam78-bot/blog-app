@@ -15,6 +15,7 @@ if (!MONGODB_URI) throw new Error('MONGODB_URI is required. Add it to your .env 
 if (!JWT_SECRET || JWT_SECRET.length < 32) throw new Error('JWT_SECRET must be at least 32 characters long.');
 
 mongoose.set('strictQuery', true);
+
 const userSchema = new mongoose.Schema({
   name: { type: String, required: true, trim: true, maxlength: 80 },
   email: { type: String, required: true, unique: true, lowercase: true, trim: true, index: true },
@@ -44,6 +45,7 @@ const publicBlog = (blog) => ({
   topic: blog.topic,
   author: blog.author?.email || blog.author?.name || 'Ink & Insight author',
   authorName: blog.author?.name || '',
+  authorId: blog.author?._id ? String(blog.author._id) : blog.author ? String(blog.author) : '',
   createdAt: blog.createdAt,
   updatedAt: blog.updatedAt
 });
@@ -60,6 +62,30 @@ function authenticate(req, res, next) {
   }
 }
 
+function escapeRegex(text = '') {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+async function getFilteredBlogs(req) {
+  const search = String(req.query.search || '').trim();
+  const topic = String(req.query.topic || '').trim();
+  const filter = {};
+
+  if (search) {
+    filter.$or = [
+      { title: { $regex: escapeRegex(search), $options: 'i' } },
+      { content: { $regex: escapeRegex(search), $options: 'i' } },
+      { topic: { $regex: escapeRegex(search), $options: 'i' } }
+    ];
+  }
+
+  if (topic && topic !== 'all') {
+    filter.topic = { $regex: `^${escapeRegex(topic)}$`, $options: 'i' };
+  }
+
+  return Blog.find(filter).populate('author', 'name email').sort({ createdAt: -1 }).lean();
+}
+
 app.get('/api/health', (req, res) => res.json({ status: 'ok', database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected' }));
 
 app.post('/api/auth/register', async (req, res, next) => {
@@ -67,13 +93,25 @@ app.post('/api/auth/register', async (req, res, next) => {
     const name = String(req.body.name || req.body.username || '').trim();
     const email = String(req.body.email || '').trim().toLowerCase();
     const password = String(req.body.password || '');
+
     if (!name || !/^\S+@\S+\.\S+$/.test(email) || password.length < 6) {
       return res.status(400).json({ message: 'Name, a valid email, and a password of at least 6 characters are required.' });
     }
-    if (await User.exists({ email })) return res.status(409).json({ message: 'An account with that email already exists.' });
-    const user = await User.create({ name, email, passwordHash: await bcrypt.hash(password, 12) });
+
+    if (await User.exists({ email })) {
+      return res.status(409).json({ message: 'An account with that email already exists.' });
+    }
+
+    const user = await User.create({
+      name,
+      email,
+      passwordHash: await bcrypt.hash(password, 12)
+    });
+
     res.status(201).json({ user: publicUser(user), token: issueToken(user) });
-  } catch (error) { next(error); }
+  } catch (error) {
+    next(error);
+  }
 });
 
 app.post('/api/auth/login', async (req, res, next) => {
@@ -81,25 +119,37 @@ app.post('/api/auth/login', async (req, res, next) => {
     const email = String(req.body.email || '').trim().toLowerCase();
     const password = String(req.body.password || '');
     const user = await User.findOne({ email }).select('+passwordHash');
-    if (!user || !(await bcrypt.compare(password, user.passwordHash))) return res.status(401).json({ message: 'Invalid email or password.' });
+
+    if (!user || !(await bcrypt.compare(password, user.passwordHash))) {
+      return res.status(401).json({ message: 'Invalid email or password.' });
+    }
+
     res.json({ user: publicUser(user), token: issueToken(user) });
-  } catch (error) { next(error); }
+  } catch (error) {
+    next(error);
+  }
 });
 
 app.get('/api/blogs', async (req, res, next) => {
   try {
-    const blogs = await Blog.find().populate('author', 'name email').sort({ createdAt: -1 }).lean();
+    const blogs = await getFilteredBlogs(req);
     res.json({ blogs: blogs.map(publicBlog) });
-  } catch (error) { next(error); }
+  } catch (error) {
+    next(error);
+  }
 });
 
 app.get('/api/blogs/:id', async (req, res, next) => {
   try {
     if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ message: 'Invalid blog id.' });
+
     const blog = await Blog.findById(req.params.id).populate('author', 'name email').lean();
     if (!blog) return res.status(404).json({ message: 'Blog not found.' });
+
     res.json({ blog: publicBlog(blog) });
-  } catch (error) { next(error); }
+  } catch (error) {
+    next(error);
+  }
 });
 
 app.post('/api/blogs', authenticate, async (req, res, next) => {
@@ -107,11 +157,68 @@ app.post('/api/blogs', authenticate, async (req, res, next) => {
     const title = String(req.body.title || '').trim();
     const content = String(req.body.content || req.body.body || '').trim();
     const topic = String(req.body.topic || req.body.category || 'General').trim();
-    if (!title || !content) return res.status(400).json({ message: 'Title and content are required.' });
+
+    if (!title || !content) {
+      return res.status(400).json({ message: 'Title and content are required.' });
+    }
+
     const blog = await Blog.create({ title, content, topic, author: req.user.id });
     const saved = await blog.populate('author', 'name email');
     res.status(201).json({ blog: publicBlog(saved) });
-  } catch (error) { next(error); }
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put('/api/blogs/:id', authenticate, async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(400).json({ message: 'Invalid blog id.' });
+    }
+
+    const blog = await Blog.findById(req.params.id);
+    if (!blog) return res.status(404).json({ message: 'Blog not found.' });
+    if (blog.author.toString() !== req.user.id) {
+      return res.status(403).json({ message: 'You can only edit your own blog.' });
+    }
+
+    const title = String(req.body.title || blog.title || '').trim();
+    const content = String(req.body.content || req.body.body || blog.content || '').trim();
+    const topic = String(req.body.topic || req.body.category || blog.topic || 'General').trim();
+
+    if (!title || !content) {
+      return res.status(400).json({ message: 'Title and content are required.' });
+    }
+
+    blog.title = title;
+    blog.content = content;
+    blog.topic = topic;
+    await blog.save();
+
+    const updated = await Blog.findById(blog._id).populate('author', 'name email');
+    res.json({ blog: publicBlog(updated) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.delete('/api/blogs/:id', authenticate, async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(400).json({ message: 'Invalid blog id.' });
+    }
+
+    const blog = await Blog.findById(req.params.id);
+    if (!blog) return res.status(404).json({ message: 'Blog not found.' });
+    if (blog.author.toString() !== req.user.id) {
+      return res.status(403).json({ message: 'You can only delete your own blog.' });
+    }
+
+    await blog.deleteOne();
+    res.json({ message: 'Blog deleted successfully.', id: req.params.id });
+  } catch (error) {
+    next(error);
+  }
 });
 
 app.use((error, req, res, next) => {
@@ -122,9 +229,12 @@ app.use((error, req, res, next) => {
 
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'index.html')));
 
-mongoose.connect(MONGODB_URI).then(() => {
-  app.listen(PORT, () => console.log(`Ink & Insight server running at http://localhost:${PORT}`));
-}).catch((error) => {
-  console.error('MongoDB connection failed:', error.message);
-  process.exit(1);
-});
+mongoose.connect(MONGODB_URI)
+  .then(() => {
+    app.listen(PORT, () => console.log(`Ink & Insight server running at http://localhost:${PORT}`));
+  })
+  .catch((error) => {
+    console.error('MongoDB connection failed:', error.message);
+    process.exit(1);
+  });
+
