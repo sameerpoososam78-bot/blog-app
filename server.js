@@ -2,21 +2,51 @@ const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const mongoose = require('mongoose');
 const path = require('path');
 require('dotenv').config();
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-const JWT_SECRET = process.env.JWT_SECRET || 'development-only-secret';
-const users = [];
-const blogs = [];
+const PORT = Number(process.env.PORT || 3000);
+const JWT_SECRET = process.env.JWT_SECRET;
+const MONGODB_URI = process.env.MONGODB_URI;
+
+if (!MONGODB_URI) throw new Error('MONGODB_URI is required. Add it to your .env file.');
+if (!JWT_SECRET || JWT_SECRET.length < 32) throw new Error('JWT_SECRET must be at least 32 characters long.');
+
+mongoose.set('strictQuery', true);
+const userSchema = new mongoose.Schema({
+  name: { type: String, required: true, trim: true, maxlength: 80 },
+  email: { type: String, required: true, unique: true, lowercase: true, trim: true, index: true },
+  passwordHash: { type: String, required: true, select: false }
+}, { timestamps: true });
+
+const blogSchema = new mongoose.Schema({
+  title: { type: String, required: true, trim: true, maxlength: 160 },
+  content: { type: String, required: true, trim: true, maxlength: 100000 },
+  topic: { type: String, default: 'General', trim: true, maxlength: 60 },
+  author: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true }
+}, { timestamps: true });
+
+const User = mongoose.model('User', userSchema);
+const Blog = mongoose.model('Blog', blogSchema);
 
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 app.use(express.static(__dirname));
 
-const publicUser = ({ id, name, email }) => ({ id, name, email });
-const issueToken = (user) => jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
+const publicUser = (user) => ({ id: user._id, name: user.name, email: user.email });
+const issueToken = (user) => jwt.sign({ id: user._id.toString(), email: user.email }, JWT_SECRET, { expiresIn: '7d' });
+const publicBlog = (blog) => ({
+  id: blog._id,
+  title: blog.title,
+  content: blog.content,
+  topic: blog.topic,
+  author: blog.author?.email || blog.author?.name || 'Ink & Insight author',
+  authorName: blog.author?.name || '',
+  createdAt: blog.createdAt,
+  updatedAt: blog.updatedAt
+});
 
 function authenticate(req, res, next) {
   const header = req.headers.authorization || '';
@@ -30,41 +60,71 @@ function authenticate(req, res, next) {
   }
 }
 
-app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
+app.get('/api/health', (req, res) => res.json({ status: 'ok', database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected' }));
 
-app.post('/api/auth/register', async (req, res) => {
-  const name = String(req.body.name || req.body.username || '').trim();
-  const email = String(req.body.email || '').trim().toLowerCase();
-  const password = String(req.body.password || '');
-  if (!name || !email || password.length < 6) {
-    return res.status(400).json({ message: 'Name, a valid email, and a password of at least 6 characters are required.' });
-  }
-  if (users.some((user) => user.email === email)) return res.status(409).json({ message: 'An account with that email already exists.' });
-  const user = { id: String(users.length + 1), name, email, passwordHash: await bcrypt.hash(password, 12) };
-  users.push(user);
-  res.status(201).json({ user: publicUser(user), token: issueToken(user) });
+app.post('/api/auth/register', async (req, res, next) => {
+  try {
+    const name = String(req.body.name || req.body.username || '').trim();
+    const email = String(req.body.email || '').trim().toLowerCase();
+    const password = String(req.body.password || '');
+    if (!name || !/^\S+@\S+\.\S+$/.test(email) || password.length < 6) {
+      return res.status(400).json({ message: 'Name, a valid email, and a password of at least 6 characters are required.' });
+    }
+    if (await User.exists({ email })) return res.status(409).json({ message: 'An account with that email already exists.' });
+    const user = await User.create({ name, email, passwordHash: await bcrypt.hash(password, 12) });
+    res.status(201).json({ user: publicUser(user), token: issueToken(user) });
+  } catch (error) { next(error); }
 });
 
-app.post('/api/auth/login', async (req, res) => {
-  const email = String(req.body.email || '').trim().toLowerCase();
-  const password = String(req.body.password || '');
-  const user = users.find((candidate) => candidate.email === email);
-  if (!user || !(await bcrypt.compare(password, user.passwordHash))) return res.status(401).json({ message: 'Invalid email or password.' });
-  res.json({ user: publicUser(user), token: issueToken(user) });
+app.post('/api/auth/login', async (req, res, next) => {
+  try {
+    const email = String(req.body.email || '').trim().toLowerCase();
+    const password = String(req.body.password || '');
+    const user = await User.findOne({ email }).select('+passwordHash');
+    if (!user || !(await bcrypt.compare(password, user.passwordHash))) return res.status(401).json({ message: 'Invalid email or password.' });
+    res.json({ user: publicUser(user), token: issueToken(user) });
+  } catch (error) { next(error); }
 });
 
-app.get('/api/blogs', (req, res) => res.json({ blogs }));
+app.get('/api/blogs', async (req, res, next) => {
+  try {
+    const blogs = await Blog.find().populate('author', 'name email').sort({ createdAt: -1 }).lean();
+    res.json({ blogs: blogs.map(publicBlog) });
+  } catch (error) { next(error); }
+});
 
-app.post('/api/blogs', authenticate, (req, res) => {
-  const title = String(req.body.title || '').trim();
-  const content = String(req.body.content || req.body.body || '').trim();
-  const topic = String(req.body.topic || req.body.category || 'General').trim();
-  if (!title || !content) return res.status(400).json({ message: 'Title and content are required.' });
-  const blog = { id: String(blogs.length + 1), title, content, topic, author: req.user.email, createdAt: new Date().toISOString() };
-  blogs.unshift(blog);
-  res.status(201).json({ blog });
+app.get('/api/blogs/:id', async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ message: 'Invalid blog id.' });
+    const blog = await Blog.findById(req.params.id).populate('author', 'name email').lean();
+    if (!blog) return res.status(404).json({ message: 'Blog not found.' });
+    res.json({ blog: publicBlog(blog) });
+  } catch (error) { next(error); }
+});
+
+app.post('/api/blogs', authenticate, async (req, res, next) => {
+  try {
+    const title = String(req.body.title || '').trim();
+    const content = String(req.body.content || req.body.body || '').trim();
+    const topic = String(req.body.topic || req.body.category || 'General').trim();
+    if (!title || !content) return res.status(400).json({ message: 'Title and content are required.' });
+    const blog = await Blog.create({ title, content, topic, author: req.user.id });
+    const saved = await blog.populate('author', 'name email');
+    res.status(201).json({ blog: publicBlog(saved) });
+  } catch (error) { next(error); }
+});
+
+app.use((error, req, res, next) => {
+  if (error.code === 11000) return res.status(409).json({ message: 'An account with that email already exists.' });
+  console.error(error);
+  res.status(500).json({ message: 'Something went wrong on the server.' });
 });
 
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'index.html')));
 
-app.listen(PORT, () => console.log(`Ink & Insight server running at http://localhost:${PORT}`));
+mongoose.connect(MONGODB_URI).then(() => {
+  app.listen(PORT, () => console.log(`Ink & Insight server running at http://localhost:${PORT}`));
+}).catch((error) => {
+  console.error('MongoDB connection failed:', error.message);
+  process.exit(1);
+});

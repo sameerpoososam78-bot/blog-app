@@ -1,8 +1,8 @@
 {
   "name": "ink-and-insight",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
-  "description": "Ink & Insight blog application with an Express REST API",
+  "description": "Ink & Insight blog application with a MongoDB-backed Express REST API",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -16,6 +16,7 @@
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.21.1",
-    "jsonwebtoken": "^9.0.2"
+    "jsonwebtoken": "^9.0.2",
+    "mongoose": "^8.7.1"
   }
 }
